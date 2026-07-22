@@ -30,13 +30,28 @@ with no external dependencies.
 
 ## Quick start
 
+Requires **Node 22+**. No database, no Docker, no external accounts.
+
 ```bash
 npm install
-cp .env.example .env          # defaults work as-is for local development
+cp .env.example .env
+```
 
-npm run dev:as                # terminal 1 — mock authorization server on :4000
-npm run dev                   # terminal 2 — MCP resource server on :3000
+Then set `CIMD_ALLOW_INSECURE=true` in `.env`. Client IDs are HTTPS URLs in
+production, and the SSRF guard refuses loopback `http://` addresses — which is
+exactly what a local demo client is. This flag is what makes local development
+possible, and it is why the default is `false`.
 
+Two terminals:
+
+```bash
+npm run dev:as     # terminal 1 — mock authorization server on :4000
+npm run dev        # terminal 2 — MCP resource server on :3000
+```
+
+Confirm the boundary is closed:
+
+```bash
 curl -i -X POST http://localhost:3000/mcp \
   -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' \
@@ -48,6 +63,22 @@ curl -i -X POST http://localhost:3000/mcp \
 
 That 401 is the whole point: it tells a compliant MCP client exactly where to go
 to get a token.
+
+Then walk the full flow, in a third terminal:
+
+```bash
+npm run demo
+```
+
+`scripts/demo-client.ts` publishes a Client ID Metadata Document, signs a
+`private_key_jwt` assertion with the matching key, exchanges it for a
+resource-scoped access token, calls `tools/list`, `whoami` and `echo` over
+Streamable HTTP, and finally proves an invalid token is rejected — printing each
+step. It is the fastest way to see what the server actually does.
+
+You cannot reproduce this with `curl` alone: the client must *publish* a metadata
+document at its own `client_id` URL for the authorization server to fetch, which
+needs a running HTTP server. That is what the demo script provides.
 
 ## What is actually implemented
 
@@ -182,6 +213,38 @@ Two findings that came out of *running* these rather than writing them:
 2. A "rejects whitespace-padded token" HTTP test was wrong: RFC 9110 strips
    optional whitespace around header values, so the padding never arrives. The
    assertion was moved down to the verifier, where it is meaningful.
+
+## Deploying
+
+### Vercel: not without changes
+
+Vercel is a poor fit for this server as written, and it is worth being precise
+about why rather than discovering it after a deploy.
+
+| Blocker | Why it breaks | What it would take |
+|---|---|---|
+| Sessions live in an in-memory `Map` | Serverless invocations do not share memory. A session created by one instance is invisible to the next, so every follow-up request 404s. | Run the transport stateless (`sessionIdGenerator: undefined`), or move sessions to Redis. |
+| Streamable HTTP holds an SSE stream open | Functions have a hard max duration. Long-lived server→client streams get severed mid-flight. | Stateless request/response only — no server-initiated notifications. |
+| The mock AS mints an **ephemeral keypair per boot** | Every cold start publishes a different JWKS, so tokens issued by one instance fail verification on the next, seemingly at random. | Do not deploy the mock AS. Point at a real authorization server, or load a fixed signing key from a secret. |
+| The `jti` replay guard is per-process | Assertion replay protection silently stops working across instances. | Shared store (Redis). |
+
+**The honest recommendation:** deploy the resource server *stateless* on Vercel
+and point `MCP_ISSUER_URL` / `MCP_JWKS_URI` at a real authorization server. The
+mock AS is a development tool and should never be public.
+
+If you want the full stateful behaviour, use a container host that gives you a
+long-lived process — Fly.io, Railway, or Render. A `Dockerfile` on any of those
+is materially less work than reshaping this for serverless.
+
+Note that Vercel's session, duration and memory constraints are what force the
+design change here — the code is not doing anything unusual. Any stateful
+long-lived-connection server meets the same wall.
+
+### Neither mode is deployed today
+
+This repository has never been deployed to any environment. Nothing above has
+been executed against a real Vercel project; it is an analysis of the code
+against documented platform constraints, not a deployment report.
 
 ## Do not deploy this as-is
 

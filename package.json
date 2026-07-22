@@ -15,7 +15,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "demo": "tsx scripts/demo-client.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
