@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { decodeJwt } from 'jose';
 import type { Express } from 'express';
+import { randomBytes } from 'node:crypto';
 import { createMockAuthServer, CLIENT_ASSERTION_TYPE } from '../src/mock-as/app.js';
+import { ClientSecretStore, hashClientSecret } from '../src/auth/client-secret.js';
 import type { AuthServerConfig } from '../src/config.js';
 import { startTestClient, type TestClient } from './helpers/test-client.js';
 
@@ -211,6 +213,117 @@ describe('POST /token — client_credentials + private_key_jwt', () => {
             });
             expect(res.status).toBe(400);
             expect(res.body.error).toBe('unauthorized_client');
+        });
+    });
+
+    describe('client_secret authentication (constant-time path)', () => {
+        const SECRET = randomBytes(32).toString('base64url');
+        let secretApp: Express;
+        let secretClient: TestClient;
+
+        beforeEach(async () => {
+            secretClient = await newClient({ tokenEndpointAuthMethod: 'client_secret_basic' });
+            secretClient.serveRaw(
+                JSON.stringify({
+                    client_id: secretClient.clientId,
+                    token_endpoint_auth_method: 'client_secret_basic',
+                    grant_types: ['client_credentials'],
+                    scope: 'mcp:tools',
+                }),
+            );
+            ({ app: secretApp } = await createMockAuthServer(config, {
+                secrets: new ClientSecretStore([
+                    { clientId: secretClient.clientId, hash: await hashClientSecret(SECRET) },
+                ]),
+            }));
+        });
+
+        const basicHeader = (id: string, secret: string) =>
+            `Basic ${Buffer.from(`${encodeURIComponent(id)}:${encodeURIComponent(secret)}`).toString('base64')}`;
+
+        const post = (header: string) =>
+            request(secretApp)
+                .post('/token')
+                .set('authorization', header)
+                .type('form')
+                .send({ grant_type: 'client_credentials', resource: RESOURCE });
+
+        it('issues a token to a client presenting the correct secret', async () => {
+            const res = await post(basicHeader(secretClient.clientId, SECRET));
+            expect(res.status).toBe(200);
+            expect(decodeJwt(res.body.access_token).sub).toBe(secretClient.clientId);
+        });
+
+        it('rejects an incorrect secret', async () => {
+            const res = await post(basicHeader(secretClient.clientId, randomBytes(32).toString('base64url')));
+            expect(res.status).toBe(401);
+            expect(res.body.error).toBe('invalid_client');
+        });
+
+        it('rejects a secret that is a prefix of the real one', async () => {
+            const res = await post(basicHeader(secretClient.clientId, SECRET.slice(0, -1)));
+            expect(res.status).toBe(401);
+        });
+
+        it('gives an unregistered client the same response as a wrong secret', async () => {
+            // Identical bodies mean the endpoint cannot be used to enumerate
+            // which client_ids are registered.
+            const unknown = await post(basicHeader('https://not-registered.example/client', SECRET));
+            const wrong = await post(basicHeader(secretClient.clientId, 'x'.repeat(43)));
+            expect(unknown.status).toBe(wrong.status);
+            expect(unknown.body).toEqual(wrong.body);
+        });
+
+        it('accepts client_secret_post as well as Basic', async () => {
+            const client = await newClient({ tokenEndpointAuthMethod: 'client_secret_post' });
+            client.serveRaw(
+                JSON.stringify({
+                    client_id: client.clientId,
+                    token_endpoint_auth_method: 'client_secret_post',
+                    grant_types: ['client_credentials'],
+                    scope: 'mcp:tools',
+                }),
+            );
+            const { app } = await createMockAuthServer(config, {
+                secrets: new ClientSecretStore([
+                    { clientId: client.clientId, hash: await hashClientSecret(SECRET) },
+                ]),
+            });
+            const res = await request(app).post('/token').type('form').send({
+                grant_type: 'client_credentials',
+                resource: RESOURCE,
+                client_id: client.clientId,
+                client_secret: SECRET,
+            });
+            expect(res.status).toBe(200);
+        });
+
+        it('refuses a client authenticating with a mechanism it is not registered for', async () => {
+            // The client's document says client_secret_basic; presenting a valid
+            // assertion instead must not work.
+            const assertion = await secretClient.createAssertion({ audience: TOKEN_ENDPOINT });
+            const res = await request(secretApp).post('/token').type('form').send({
+                grant_type: 'client_credentials',
+                client_assertion_type: CLIENT_ASSERTION_TYPE,
+                client_assertion: assertion,
+                resource: RESOURCE,
+            });
+            expect(res.status).toBe(401);
+        });
+
+        it('rejects presenting two mechanisms at once', async () => {
+            const res = await request(secretApp)
+                .post('/token')
+                .set('authorization', basicHeader(secretClient.clientId, SECRET))
+                .type('form')
+                .send({
+                    grant_type: 'client_credentials',
+                    resource: RESOURCE,
+                    client_id: secretClient.clientId,
+                    client_secret: SECRET,
+                });
+            expect(res.status).toBe(400);
+            expect(res.body.error).toBe('invalid_request');
         });
     });
 

@@ -1,12 +1,20 @@
 import express, { type Express, type Response } from 'express';
 import { randomUUID } from 'node:crypto';
-import { createLocalJWKSet, createRemoteJWKSet, decodeJwt, jwtVerify, SignJWT, type JSONWebKeySet } from 'jose';
+import { SignJWT } from 'jose';
 import { CimdResolver } from '../auth/cimd.js';
 import { ACCESS_TOKEN_ALG } from '../auth/verifiers.js';
+import {
+    ClientAuthError,
+    parseClientAuthentication,
+    SUPPORTED_AUTH_METHODS,
+    CLIENT_ASSERTION_TYPE,
+} from '../auth/client-authentication.js';
+import { ClientSecretStore } from '../auth/client-secret.js';
+import { verifyClient } from './verify-client.js';
 import { canonicalResourceUrl, type AuthServerConfig } from '../config.js';
 import { generateSigningKey, type SigningKey } from './keys.js';
 
-export const CLIENT_ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
+export { CLIENT_ASSERTION_TYPE };
 export const ACCESS_TOKEN_TTL_SECONDS = 300;
 
 /** Client assertions are single-use; this remembers the ones already spent. */
@@ -49,11 +57,30 @@ export interface MockAuthServer {
  * It is a *mock*: tokens are in-memory, keys are ephemeral, there is no
  * persistence, no rate limiting, and no admin surface. Do not deploy it.
  */
-export async function createMockAuthServer(config: AuthServerConfig): Promise<MockAuthServer> {
+export async function createMockAuthServer(
+    config: AuthServerConfig,
+    options: {
+        /**
+         * Restricts which client_ids may be dereferenced at all. Required for any
+         * publicly reachable deployment — see CimdOptions.allowlist.
+         */
+        cimdAllowlist?: (clientId: string) => boolean;
+        /** See CimdOptions.internalRewrite. Demo/self-hosting deployments only. */
+        cimdInternalRewrite?: (clientId: string) => string | null;
+        /**
+         * Registered client secrets, stored as scrypt hashes. Clients whose
+         * metadata declares client_secret_basic/post are verified against this.
+         */
+        secrets?: ClientSecretStore;
+    } = {},
+): Promise<MockAuthServer> {
+    const secrets = options.secrets ?? new ClientSecretStore();
     const signingKey = await generateSigningKey();
     const resolver = new CimdResolver({
         allowInsecure: config.cimdAllowInsecure,
         cacheTtlSeconds: config.cimdCacheTtlSeconds,
+        ...(options.cimdAllowlist ? { allowlist: options.cimdAllowlist } : {}),
+        ...(options.cimdInternalRewrite ? { internalRewrite: options.cimdInternalRewrite } : {}),
     });
     const replayGuard = new JtiReplayGuard();
     const tokenEndpoint = `${config.issuerUrl}/token`;
@@ -70,7 +97,7 @@ export async function createMockAuthServer(config: AuthServerConfig): Promise<Mo
             token_endpoint: tokenEndpoint,
             jwks_uri: `${config.issuerUrl}/jwks.json`,
             grant_types_supported: ['client_credentials'],
-            token_endpoint_auth_methods_supported: ['private_key_jwt'],
+            token_endpoint_auth_methods_supported: SUPPORTED_AUTH_METHODS,
             token_endpoint_auth_signing_alg_values_supported: ['ES256', 'RS256'],
             response_types_supported: [],
             scopes_supported: ['mcp:tools'],
@@ -96,24 +123,15 @@ export async function createMockAuthServer(config: AuthServerConfig): Promise<Mo
 
     app.post('/token', async (req, res) => {
         const body = (req.body ?? {}) as Record<string, unknown>;
-        const grantType = body['grant_type'];
-        const assertionType = body['client_assertion_type'];
-        const assertion = body['client_assertion'];
-        const resource = body['resource'];
 
-        if (grantType !== 'client_credentials') {
+        if (body['grant_type'] !== 'client_credentials') {
             return oauthError(res, 400, 'unsupported_grant_type', 'only client_credentials is supported');
-        }
-        if (assertionType !== CLIENT_ASSERTION_TYPE) {
-            return oauthError(res, 401, 'invalid_client', 'private_key_jwt client authentication is required');
-        }
-        if (typeof assertion !== 'string' || assertion.length === 0) {
-            return oauthError(res, 401, 'invalid_client', 'client_assertion is required');
         }
 
         // RFC 8707: the client must name the resource it wants a token for, and
         // we only mint tokens narrowly scoped to that audience. A token for one
         // MCP server must never be replayable against another.
+        const resource = body['resource'];
         if (typeof resource !== 'string' || resource.length === 0) {
             return oauthError(res, 400, 'invalid_target', 'resource parameter is required');
         }
@@ -127,51 +145,23 @@ export async function createMockAuthServer(config: AuthServerConfig): Promise<Mo
             return oauthError(res, 400, 'invalid_target', 'unknown resource identifier');
         }
 
-        // Read `iss` unverified purely to learn which client_id to resolve. The
-        // assertion is not trusted until it is verified against that client's
-        // published keys below.
-        let clientId: string;
+        // Identify and prove the client. Both mechanisms funnel through the same
+        // generic failure so the endpoint cannot be used to enumerate client_ids.
+        let verified;
         try {
-            clientId = decodeJwt(assertion).iss ?? '';
-        } catch {
-            return oauthError(res, 401, 'invalid_client', 'client_assertion is malformed');
+            const presented = parseClientAuthentication(req);
+            verified = await verifyClient({ resolver, secrets, replayGuard, tokenEndpoint }, presented);
+        } catch (err) {
+            if (err instanceof ClientAuthError) {
+                const status = err.oauthError === 'invalid_request' ? 400 : 401;
+                return oauthError(res, status, err.oauthError, err.message);
+            }
+            throw err;
         }
-        if (!clientId) {
-            return oauthError(res, 401, 'invalid_client', 'client_assertion is missing an iss claim');
-        }
+        const { clientId, metadata: doc } = verified;
 
-        let doc;
-        try {
-            doc = await resolver.resolve(clientId);
-        } catch {
-            return oauthError(res, 401, 'invalid_client', 'client metadata document could not be resolved');
-        }
         if (!doc.grant_types.includes('client_credentials')) {
             return oauthError(res, 400, 'unauthorized_client', 'client is not registered for client_credentials');
-        }
-
-        const keys = doc.jwks
-            ? createLocalJWKSet(doc.jwks as unknown as JSONWebKeySet)
-            : createRemoteJWKSet(new URL(doc.jwks_uri!), { cacheMaxAge: 600_000, timeoutDuration: 5_000 });
-
-        let claims;
-        try {
-            ({ payload: claims } = await jwtVerify(assertion, keys, {
-                issuer: clientId,
-                subject: clientId,
-                audience: tokenEndpoint,
-                algorithms: ['ES256', 'RS256'],
-                clockTolerance: 5,
-                maxTokenAge: '5 minutes',
-                requiredClaims: ['iss', 'sub', 'aud', 'exp', 'jti'],
-            }));
-        } catch {
-            return oauthError(res, 401, 'invalid_client', 'client_assertion failed verification');
-        }
-
-        const assertionExpiryMs = (claims.exp ?? 0) * 1000;
-        if (!replayGuard.claim(claims.jti!, assertionExpiryMs)) {
-            return oauthError(res, 401, 'invalid_client', 'client_assertion has already been used');
         }
 
         // Grant the intersection of what was asked for and what the client's

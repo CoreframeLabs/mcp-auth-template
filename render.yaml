@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: mcp-auth-demo
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /healthz
+    # Sessions and the jti replay guard are in-process. More than one instance
+    # would split them and cause intermittent, hard-to-diagnose failures.
+    numInstances: 1
+    envVars:
+      - key: PUBLIC_URL
+        # Must be the externally reachable origin. It becomes the OAuth issuer,
+        # the RFC 8707 resource identifier, and the client_id URLs the
+        # authorization server dereferences. Wrong value => every token fails
+        # its audience check.
+        sync: false

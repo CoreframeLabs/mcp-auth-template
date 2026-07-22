@@ -1,6 +1,7 @@
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { z } from 'zod';
+import { SUPPORTED_AUTH_METHODS, type ClientAuthMethod } from './client-authentication.js';
 
 /**
  * Client ID Metadata Documents.
@@ -81,6 +82,33 @@ export interface CimdOptions {
     cacheTtlSeconds: number;
     /** Injectable for tests. Defaults to global fetch. */
     fetchImpl?: typeof fetch;
+    /**
+     * Optional allowlist. When set, only client_ids it accepts are dereferenced
+     * at all.
+     *
+     * Open CIMD resolution means anyone who can reach the token endpoint can
+     * make this server issue an HTTP request to a URL of their choosing and
+     * learn whether it succeeded — an unauthenticated request amplifier and a
+     * coarse host prober, even with the private-address guards below in force.
+     * That is acceptable for a closed deployment with known clients; it is not
+     * acceptable for a public demo. Set this there.
+     */
+    allowlist?: (clientId: string) => boolean;
+    /**
+     * Maps a client_id to a different address to actually fetch it from.
+     *
+     * Exists for the single case of a server hosting client metadata documents
+     * for itself: inside a container, the public origin usually does not resolve,
+     * and relying on hairpin routing out to the internet and back is slow and
+     * frequently blocked. The rewritten address is used for transport only — the
+     * document must still declare the original public client_id, which is
+     * verified below.
+     *
+     * Only consulted for client_ids that already passed the allowlist, and it
+     * skips the public-address guard by design, since the target is deliberately
+     * local. Never wire this to anything caller-controlled.
+     */
+    internalRewrite?: (clientId: string) => string | null;
 }
 
 async function assertFetchableUrl(url: URL, label: string, clientId: string, allowInsecure: boolean): Promise<void> {
@@ -174,6 +202,12 @@ export class CimdResolver {
     }
 
     private async fetchAndValidate(clientId: string): Promise<ClientMetadata> {
+        // Checked before parsing or resolving anything, so a rejected client_id
+        // never causes an outbound request of any kind.
+        if (this.options.allowlist && !this.options.allowlist(clientId)) {
+            throw new CimdError('client_id is not permitted by this deployment', clientId);
+        }
+
         let url: URL;
         try {
             url = new URL(clientId);
@@ -181,7 +215,14 @@ export class CimdResolver {
             throw new CimdError('client_id must be an absolute URL', clientId);
         }
 
-        await assertFetchableUrl(url, 'client_id', clientId, this.options.allowInsecure);
+        // Transport-only redirection to a local address. The identity being
+        // proven remains the original client_id.
+        const internal = this.options.internalRewrite?.(clientId) ?? null;
+        if (internal) {
+            url = new URL(internal);
+        } else {
+            await assertFetchableUrl(url, 'client_id', clientId, this.options.allowInsecure);
+        }
 
         let res: Response;
         try {
@@ -223,17 +264,26 @@ export class CimdResolver {
         if (doc.client_id !== clientId) {
             throw new CimdError('client metadata document client_id does not match its URL', clientId);
         }
-        if (doc.token_endpoint_auth_method !== 'private_key_jwt') {
-            throw new CimdError('only private_key_jwt client authentication is supported', clientId);
+        if (!SUPPORTED_AUTH_METHODS.includes(doc.token_endpoint_auth_method as ClientAuthMethod)) {
+            throw new CimdError(
+                `unsupported token_endpoint_auth_method (expected one of: ${SUPPORTED_AUTH_METHODS.join(', ')})`,
+                clientId,
+            );
         }
-        if (!doc.jwks && !doc.jwks_uri) {
-            throw new CimdError('client metadata document must supply jwks or jwks_uri', clientId);
-        }
-        if (doc.jwks && doc.jwks_uri) {
-            throw new CimdError('client metadata document must not supply both jwks and jwks_uri', clientId);
-        }
-        if (doc.jwks_uri) {
-            await assertFetchableUrl(new URL(doc.jwks_uri), 'jwks_uri', clientId, this.options.allowInsecure);
+
+        // Key material is required for private_key_jwt and meaningless without
+        // it; secret-based clients prove themselves out of band instead, and a
+        // metadata document is public, so it must never carry a secret.
+        if (doc.token_endpoint_auth_method === 'private_key_jwt') {
+            if (!doc.jwks && !doc.jwks_uri) {
+                throw new CimdError('private_key_jwt clients must supply jwks or jwks_uri', clientId);
+            }
+            if (doc.jwks && doc.jwks_uri) {
+                throw new CimdError('client metadata document must not supply both jwks and jwks_uri', clientId);
+            }
+            if (doc.jwks_uri) {
+                await assertFetchableUrl(new URL(doc.jwks_uri), 'jwks_uri', clientId, this.options.allowInsecure);
+            }
         }
         return doc;
     }

@@ -16,11 +16,15 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "demo": "tsx scripts/demo-client.ts"
+    "demo": "tsx scripts/demo-client.ts",
+    "dev:demo": "tsx watch src/demo/index.ts",
+    "start:demo": "node dist/demo/index.js",
+    "hash-secret": "tsx scripts/hash-secret.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.6.0",
     "jose": "^6.2.4",
     "zod": "^4.4.3"
   },

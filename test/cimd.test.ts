@@ -69,9 +69,39 @@ describe('CimdResolver', () => {
         await expect(resolver().resolve(client.clientId)).rejects.toThrow(/HTTP 404/);
     });
 
-    it('rejects a client that does not use private_key_jwt', async () => {
+    it('rejects an unsupported token_endpoint_auth_method', async () => {
+        const client = await newClient({ tokenEndpointAuthMethod: 'tls_client_auth' });
+        await expect(resolver().resolve(client.clientId)).rejects.toThrow(/unsupported token_endpoint_auth_method/);
+    });
+
+    it('rejects `none`, so a client cannot opt out of authentication', async () => {
+        const client = await newClient({ tokenEndpointAuthMethod: 'none' });
+        await expect(resolver().resolve(client.clientId)).rejects.toThrow(/unsupported token_endpoint_auth_method/);
+    });
+
+    it('accepts a client_secret_post client, which needs no published keys', async () => {
         const client = await newClient({ tokenEndpointAuthMethod: 'client_secret_post' });
-        await expect(resolver().resolve(client.clientId)).rejects.toThrow(/only private_key_jwt/);
+        client.serveRaw(
+            JSON.stringify({
+                client_id: client.clientId,
+                token_endpoint_auth_method: 'client_secret_post',
+                scope: 'mcp:tools',
+            }),
+        );
+        const doc = await resolver().resolve(client.clientId);
+        expect(doc.token_endpoint_auth_method).toBe('client_secret_post');
+        expect(doc.jwks).toBeUndefined();
+    });
+
+    it('still requires keys for a private_key_jwt client', async () => {
+        const client = await newClient();
+        client.serveRaw(
+            JSON.stringify({
+                client_id: client.clientId,
+                token_endpoint_auth_method: 'private_key_jwt',
+            }),
+        );
+        await expect(resolver().resolve(client.clientId)).rejects.toThrow(/must supply jwks or jwks_uri/);
     });
 
     it('rejects a document carrying neither jwks nor jwks_uri', async () => {
