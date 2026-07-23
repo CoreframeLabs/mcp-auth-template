@@ -118,7 +118,7 @@ a token.
 ### Verify everything
 
 ```bash
-npm test            # 119 tests
+npm test            # 132 tests
 npm run typecheck
 npm run build
 ```
@@ -322,7 +322,7 @@ src/
     verify-client.ts         proves client identity per mechanism
   demo/                      hosted interactive demo
   util/safe-compare.ts       constant-time string comparison
-test/                        119 tests
+test/                        132 tests
 scripts/
   demo-client.ts             scripted end-to-end client
   hash-secret.ts             client secret generation
