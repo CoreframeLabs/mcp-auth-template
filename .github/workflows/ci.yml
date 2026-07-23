@@ -49,11 +49,41 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # gitleaks needs history to scan commits, not just the worktree.
+          # gitleaks scans commits, not just the worktree, so it needs history.
+          # A secret that was committed and later removed is still leaked.
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+
+      # Uses the gitleaks CLI directly rather than gitleaks/gitleaks-action.
+      # The action requires a paid licence for GitHub organizations; the scanner
+      # itself is MIT and has no such restriction. Same tool, no licence server,
+      # and no third-party action handling the repository token.
+      - name: Install gitleaks
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -sSfL "${base}/${archive}" -o "${archive}"
+          curl -sSfL "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o checksums.txt
+          # Verify before executing. A security tool fetched over the network is
+          # itself a supply-chain step.
+          grep " ${archive}\$" checksums.txt | sha256sum -c -
+          tar -xzf "${archive}" gitleaks
+          # Installed into RUNNER_TEMP rather than /usr/local/bin so the step
+          # needs no sudo, and removed from the workspace so it cannot be
+          # mistaken for repository content by the scan that follows.
+          mkdir -p "${RUNNER_TEMP}/bin"
+          install -m 0755 gitleaks "${RUNNER_TEMP}/bin/gitleaks"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          rm -f "${archive}" checksums.txt gitleaks
+          "${RUNNER_TEMP}/bin/gitleaks" version
+
+      - name: Scan git history for secrets
+        # `detect` was split into `git` and `dir` in gitleaks 8.19; `git` scans
+        # the full commit history. --redact keeps any finding out of the public
+        # log, which would otherwise leak the very secret it just found.
+        run: gitleaks git . --redact --no-banner --exit-code 1
 
   codeql:
     name: CodeQL
