@@ -1,28 +1,42 @@
 import { createDemoServer } from './server.js';
+import { PublicUrlError, resolvePublicUrl } from './public-url.js';
 
 /**
  * Entrypoint for the hosted demo. Railway/Render inject PORT.
  *
- * PUBLIC_URL must be the externally reachable origin, because it becomes the
- * OAuth issuer, the RFC 8707 resource identifier, and the client_id URLs the
- * authorization server dereferences. If it is wrong, every token fails its
- * audience check — so it is validated at boot rather than left to fail later.
+ * The public origin is resolved from PUBLIC_URL, or auto-detected from the
+ * platform (RAILWAY_PUBLIC_DOMAIN / RENDER_EXTERNAL_URL) when PUBLIC_URL is
+ * unset. It becomes the OAuth issuer, the RFC 8707 resource identifier, and the
+ * client_id URLs, so it is resolved and validated up front — see public-url.ts
+ * for why this is the deploy step people get wrong.
  */
 const port = Number(process.env['PORT'] ?? 3000);
-const publicUrl = process.env['PUBLIC_URL'] ?? `http://localhost:${port}`;
 
-let parsed: URL;
+let resolved;
 try {
-    parsed = new URL(publicUrl);
-} catch {
-    console.error(`[demo] PUBLIC_URL is not a valid URL: ${publicUrl}`);
-    process.exit(1);
+    resolved = resolvePublicUrl(process.env, port);
+} catch (err) {
+    if (err instanceof PublicUrlError) {
+        console.error(`[demo] ${err.message}`);
+        console.error('[demo] Set PUBLIC_URL to your full https origin, e.g.');
+        console.error('[demo]   PUBLIC_URL=https://your-app.up.railway.app');
+        console.error('[demo] On Railway you can also just generate a domain and leave PUBLIC_URL unset.');
+        process.exit(1);
+    }
+    throw err;
 }
 
-const isLoopback = ['localhost', '127.0.0.1', '::1'].includes(parsed.hostname);
-if (parsed.protocol !== 'https:' && !isLoopback) {
-    console.error(`[demo] PUBLIC_URL must use https in a public deployment (got ${publicUrl}).`);
-    process.exit(1);
+const { url: publicUrl, source, isLoopback, suspectedMisconfiguration } = resolved;
+
+if (suspectedMisconfiguration) {
+    // Loud, because the platform-rollback-on-crash behaviour otherwise hides it:
+    // better to boot with a visible warning than to exit and be rolled back to a
+    // stale instance.
+    console.warn('[demo] ============================================================');
+    console.warn('[demo] WARNING: falling back to a localhost public URL on what looks');
+    console.warn('[demo] like a deployed host. External clients will not work.');
+    console.warn('[demo] Generate a public domain, or set PUBLIC_URL explicitly.');
+    console.warn('[demo] ============================================================');
 }
 
 const { app, shutdown, registry } = await createDemoServer({
@@ -34,7 +48,7 @@ const { app, shutdown, registry } = await createDemoServer({
 
 const server = app.listen(port, () => {
     console.log(`[demo] listening on :${port}`);
-    console.log(`[demo] public url:  ${publicUrl}`);
+    console.log(`[demo] public url:  ${publicUrl}  (from ${source})`);
     console.log(`[demo] demo page:   ${publicUrl}/demo/`);
     console.log(`[demo] allowlisted client ids:`);
     for (const id of registry.allowedIds) console.log(`         ${id}`);
