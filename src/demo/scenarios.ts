@@ -161,6 +161,19 @@ async function exchange(
     return { status: res.status, body, json };
 }
 
+/** The JSON-RPC 2.0 request the demo sends to /mcp. Shared so the transcript
+ *  shows the exact bytes that were sent, not a paraphrase. */
+export const INITIALIZE_REQUEST = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'coreframe-demo', version: '1.0.0' },
+    },
+} as const;
+
 async function callMcp(
     ctx: Ctx,
     token: string | null,
@@ -172,16 +185,7 @@ async function callMcp(
             accept: 'application/json, text/event-stream',
             ...(token ? { authorization: `Bearer ${token}` } : {}),
         },
-        body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'initialize',
-            params: {
-                protocolVersion: '2025-06-18',
-                capabilities: {},
-                clientInfo: { name: 'coreframe-demo', version: '1.0.0' },
-            },
-        }),
+        body: JSON.stringify(INITIALIZE_REQUEST),
     });
     const body = await res.text();
     const headers: Record<string, string> = {};
@@ -221,7 +225,7 @@ export async function runScenario(ctx: Ctx, scenario: ScenarioId): Promise<Scena
         const mcp = await callMcp(ctx, null);
         transcript.push({
             step: '2. Call the MCP server with no credentials',
-            request: { method: 'POST', url: '/mcp' },
+            request: { method: 'POST', url: '/mcp', body: JSON.stringify(INITIALIZE_REQUEST, null, 2) },
             response: { status: mcp.status, headers: mcp.headers, body: truncate(mcp.body) },
             outcome: mcp.status === 401 ? 'rejected' : 'ok',
         });
@@ -303,7 +307,7 @@ export async function runScenario(ctx: Ctx, scenario: ScenarioId): Promise<Scena
     const mcp = await callMcp(ctx, token);
     transcript.push({
         step: `${scenario === 'tampered-token' ? '5' : '4'}. Call the MCP server with the token`,
-        request: { method: 'POST', url: '/mcp', body: 'initialize' },
+        request: { method: 'POST', url: '/mcp', body: JSON.stringify(INITIALIZE_REQUEST, null, 2) },
         response: { status: mcp.status, headers: mcp.headers, body: truncate(mcp.body) },
         outcome: mcp.status === 200 ? 'ok' : 'rejected',
     });

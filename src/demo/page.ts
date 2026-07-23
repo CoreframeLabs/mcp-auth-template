@@ -4,6 +4,9 @@ import type { ScenarioMeta } from './scenarios.js';
 const escapeHtml = (s: string): string =>
     s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 
+/** Where the lead-capture CTA points. Coreframe's contact/consultation page. */
+const LEAD_CTA_URL = 'https://coreframe-website-six.vercel.app/#data';
+
 /**
  * The demo page, rendered as a single self-contained document.
  *
@@ -90,6 +93,48 @@ export function renderDemoPage(scenarios: ScenarioMeta[], registry: DemoClientRe
   footer { margin-top:3rem; padding-top:1.2rem; border-top:1px solid var(--line);
            color:var(--muted); font-size:.85rem; }
   a { color:var(--accent); }
+
+  /* JSON-RPC / error rendering inside transcripts */
+  .frame-label { display:inline-block; font-size:.66rem; text-transform:uppercase;
+                 letter-spacing:.06em; font-weight:700; padding:.12rem .4rem;
+                 border-radius:4px; margin:.5rem 0 .1rem; background:var(--code);
+                 color:var(--muted); border:1px solid var(--line); }
+  .frame-label.rpc { color:var(--accent); border-color:var(--accent); }
+  .error-boundary { border:1px solid var(--deny); border-left:3px solid var(--deny);
+                    background:var(--denybg); border-radius:8px; padding:.7rem .9rem;
+                    margin:.5rem 0 0; }
+  .error-boundary .err-head { font-weight:700; color:var(--deny); font-size:.85rem;
+                              margin:0 0 .3rem; }
+  .error-boundary pre { background:transparent; border:none; padding:0; margin:.2rem 0 0; }
+  .json-key { color:var(--accent); }
+  .json-str { color:var(--ok); }
+  .json-num { color:var(--deny); }
+
+  /* Lead-capture overlay */
+  #lead { position:fixed; right:1.1rem; bottom:1.1rem; z-index:50; width:min(340px, calc(100vw - 2rem));
+          background:var(--card); border:1px solid var(--line); border-radius:14px;
+          box-shadow:0 12px 40px rgba(0,0,0,.22); padding:1.1rem 1.15rem 1.15rem;
+          transform:translateY(0); transition:transform .25s ease, opacity .25s ease; }
+  #lead[hidden] { display:none; }
+  #lead .lead-eyebrow { font-size:.68rem; text-transform:uppercase; letter-spacing:.07em;
+                        font-weight:700; color:var(--accent); margin:0 0 .35rem; }
+  #lead p.lead-copy { margin:0 0 .85rem; font-size:.9rem; line-height:1.5; color:var(--fg); }
+  #lead .lead-cta { display:inline-block; background:var(--accent); color:#fff; font-weight:600;
+                    font-size:.88rem; text-decoration:none; padding:.55rem .95rem; border-radius:8px;
+                    width:100%; text-align:center; box-sizing:border-box; }
+  #lead .lead-cta:hover { filter:brightness(1.07); }
+  #lead .lead-dismiss { position:absolute; top:.55rem; right:.6rem; background:none; border:none;
+                        color:var(--muted); font-size:1.1rem; line-height:1; cursor:pointer;
+                        padding:.15rem .3rem; border-radius:5px; }
+  #lead .lead-dismiss:hover { background:var(--code); color:var(--fg); }
+  #leadFab { position:fixed; right:1.1rem; bottom:1.1rem; z-index:50; background:var(--accent);
+             color:#fff; border:none; border-radius:999px; padding:.7rem 1.1rem; font:inherit;
+             font-size:.85rem; font-weight:600; cursor:pointer; box-shadow:0 8px 26px rgba(0,0,0,.24); }
+  #leadFab[hidden] { display:none; }
+  @media (max-width:520px) {
+    #lead { right:.6rem; left:.6rem; bottom:.6rem; width:auto; }
+    #leadFab { right:.6rem; bottom:.6rem; }
+  }
 </style>
 </head>
 <body>
@@ -128,33 +173,94 @@ export function renderDemoPage(scenarios: ScenarioMeta[], registry: DemoClientRe
   </footer>
 </div>
 
+<!-- Lead-capture overlay -->
+<aside id="lead" aria-label="Contact Coreframe Labs">
+  <button class="lead-dismiss" id="leadDismiss" aria-label="Dismiss">&times;</button>
+  <p class="lead-eyebrow">Coreframe Labs</p>
+  <p class="lead-copy">Scaling your company's AI integrations? We help venture-backed teams
+     and enterprises build secure, production-grade custom software architectures.
+     Let's design your agent infrastructure safely.</p>
+  <a class="lead-cta" href="${LEAD_CTA_URL}" target="_blank" rel="noopener">
+     Book a 15-minute consultation &rarr;</a>
+</aside>
+<button id="leadFab" hidden aria-label="Contact Coreframe Labs">Talk to our Core Architects &rarr;</button>
+
 <script>
 const out = document.getElementById('out');
 
 function statusClass(s) { return 's' + String(s).charAt(0); }
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/** Minimal JSON syntax highlighting over already-escaped text. */
+function highlightJson(escaped) {
+  return escaped
+    .replace(/&quot;([^&]*?)&quot;(\\s*:)/g, '<span class="json-key">&quot;$1&quot;</span>$2')
+    .replace(/:\\s*&quot;([^&]*?)&quot;/g, ': <span class="json-str">&quot;$1&quot;</span>')
+    .replace(/:\\s*(-?\\d+(?:\\.\\d+)?)/g, ': <span class="json-num">$1</span>');
+}
+
+/**
+ * Normalises a response/request body for display. Streamable HTTP returns
+ * JSON-RPC inside an SSE frame ("event: message\\ndata: {…}"), so unwrap that,
+ * pretty-print any JSON, and label a JSON-RPC 2.0 frame as such.
+ */
+function formatBody(raw) {
+  if (!raw) return null;
+  let text = raw, isRpc = false;
+
+  const sse = /data:\\s*(\\{[\\s\\S]*\\})/.exec(raw);
+  const jsonSource = sse ? sse[1] : raw;
+  try {
+    const obj = JSON.parse(jsonSource);
+    isRpc = obj && obj.jsonrpc === '2.0';
+    text = JSON.stringify(obj, null, 2);
+  } catch (_) { /* not JSON — leave as-is (form body, etc.) */ }
+
+  const label = isRpc ? 'JSON-RPC 2.0' : (sse ? 'SSE frame' : null);
+  return { html: highlightJson(escapeHtml(text)), label, isRpc };
+}
+
+function renderBody(raw) {
+  const f = formatBody(raw);
+  if (!f) return '';
+  const label = f.label
+    ? '<span class="frame-label ' + (f.isRpc ? 'rpc' : '') + '">' + f.label + '</span>'
+    : '';
+  return label + '<pre>' + f.html + '</pre>';
+}
+
 function renderEntry(e) {
   const parts = ['<div class="entry"><h3>' + escapeHtml(e.step) + '</h3>'];
   if (e.detail) parts.push('<p class="detail">' + escapeHtml(e.detail) + '</p>');
   if (e.request) {
-    parts.push('<pre>' + escapeHtml(e.request.method + ' ' + e.request.url +
-      (e.request.body ? '\\n\\n' + e.request.body : '')) + '</pre>');
+    parts.push('<pre>' + escapeHtml(e.request.method + ' ' + e.request.url) + '</pre>');
+    if (e.request.body) parts.push(renderBody(e.request.body));
   }
   if (e.response) {
+    const isError = e.response.status >= 400;
     const hdrs = e.response.headers
-      ? Object.entries(e.response.headers).map(([k,v]) => k + ': ' + v).join('\\n') + '\\n\\n'
+      ? Object.entries(e.response.headers).map(([k,v]) => k + ': ' + v).join('\\n')
       : '';
     parts.push('<p class="detail"><span class="status ' + statusClass(e.response.status) +
-      '">HTTP ' + e.response.status + '</span></p>');
-    parts.push('<pre>' + escapeHtml(hdrs + (e.response.body || '')) + '</pre>');
+      '">HTTP ' + e.response.status + (isError ? ' — rejected' : '') + '</span></p>');
+    if (hdrs) parts.push('<pre>' + escapeHtml(hdrs) + '</pre>');
+    if (isError) {
+      // Structured error boundary: parse the OAuth/JSON-RPC error and present it
+      // deliberately rather than dumping a raw string.
+      parts.push('<div class="error-boundary"><p class="err-head">' + e.response.status +
+        (e.response.status === 401 ? ' Unauthorized' : e.response.status === 403 ? ' Forbidden' : '') +
+        '</p>' + (renderBody(e.response.body) || '<pre>' + escapeHtml(e.response.body || '') + '</pre>') +
+        '</div>');
+    } else if (e.response.body) {
+      parts.push(renderBody(e.response.body));
+    }
   }
   parts.push('</div>');
   return parts.join('');
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 async function run(button) {
@@ -182,6 +288,22 @@ async function run(button) {
 
 document.querySelectorAll('.scenario').forEach(b =>
   b.addEventListener('click', () => run(b)));
+
+// Lead-capture overlay: dismissible, remembered for the session so it does not
+// nag while someone works through the scenarios.
+(function () {
+  const card = document.getElementById('lead');
+  const fab = document.getElementById('leadFab');
+  const dismiss = document.getElementById('leadDismiss');
+  const KEY = 'coreframe-lead-dismissed';
+  function collapse() { card.hidden = true; fab.hidden = false; try { sessionStorage.setItem(KEY, '1'); } catch (_) {} }
+  function expand() { card.hidden = false; fab.hidden = true; try { sessionStorage.removeItem(KEY); } catch (_) {} }
+  let dismissed = false;
+  try { dismissed = sessionStorage.getItem(KEY) === '1'; } catch (_) {}
+  if (dismissed) collapse();
+  dismiss.addEventListener('click', collapse);
+  fab.addEventListener('click', expand);
+})();
 </script>
 </body>
 </html>`;

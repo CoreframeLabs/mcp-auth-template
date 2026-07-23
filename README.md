@@ -5,13 +5,22 @@ transport, OAuth 2.1, Client ID Metadata Documents, and constant-time credential
 verification — with a mock authorization server so the whole flow runs on your
 laptop with no external accounts.
 
+[![Live Demo](https://img.shields.io/badge/%E2%96%B6%20Live%20Demo-try%20it%20now-2f5bea?style=for-the-badge)](https://mcp-auth-demo-production-d421.up.railway.app/demo/)
+
 [![CI](https://github.com/CoreframeLabs/mcp-auth-template/actions/workflows/ci.yml/badge.svg)](https://github.com/CoreframeLabs/mcp-auth-template/actions/workflows/ci.yml)
+
+**▶ Live demo:** **[mcp-auth-demo-production-d421.up.railway.app/demo/](https://mcp-auth-demo-production-d421.up.railway.app/demo/)** — run the real auth flow in your browser and watch each defence accept or reject a request.
 
 Most MCP servers today run over stdio on localhost with no authentication at
 all. The moment one becomes *remote*, it needs a real authorization story. This
 template is that story, built to be read: every security decision has a comment
 explaining why, including the places where a defence is deliberately **not**
 applied.
+
+> **Scaling your company's AI integrations?** Coreframe Labs helps venture-backed
+> teams and enterprises build secure, production-grade custom software
+> architectures. Let's design your agent infrastructure safely —
+> **[talk to our Core Architects →](https://coreframe-website-six.vercel.app/#data)**
 
 ---
 
@@ -54,30 +63,20 @@ reasoning is in the code.
 
 ---
 
-## Quick start
+## Quick start — 3 steps
 
-**Requires Node 22+.** No database, no Docker, no accounts.
-
-```bash
-git clone https://github.com/CoreframeLabs/mcp-auth-template.git
-cd mcp-auth-template
-npm install
-cp .env.example .env
-```
-
-Set `CIMD_ALLOW_INSECURE=true` in `.env`. Client IDs are HTTPS URLs in
-production and the SSRF guard refuses loopback `http://` addresses — which is
-exactly what a local demo client is. This flag is why local development works,
-and why it defaults to `false`.
-
-### Option A — the interactive demo (start here)
+**Requires Node 22+.** No database, no Docker, no accounts, no `.env`.
 
 ```bash
-npm run dev:demo        # http://localhost:3000
+npm install                              # 1. install
+npm run dev                              # 2. run the all-in-one demo (:3000)
+open http://localhost:3000/demo/         # 3. open it
 ```
 
-Open it and click through the scenarios. Each one runs the **real** flow against
-the server and shows you the actual HTTP exchange:
+That's the whole thing. `npm run dev` boots the authorization server, the MCP
+resource server and the interactive UI in one process. Click through the
+scenarios — each runs the **real** flow against the server and shows the actual
+HTTP exchange:
 
 | Scenario | Outcome |
 |---|---|
@@ -90,12 +89,15 @@ the server and shows you the actual HTTP exchange:
 | Token with an edited payload | 401 at the MCP server |
 | No `Authorization` header | 401 + `WWW-Authenticate` |
 
-### Option B — the two servers separately
+Prefer not to install anything? The same UI is live at
+**[mcp-auth-demo-production-d421.up.railway.app/demo/](https://mcp-auth-demo-production-d421.up.railway.app/demo/)**.
+
+### Advanced — run the pieces separately
 
 ```bash
 npm run dev:as          # mock authorization server on :4000
-npm run dev             # MCP resource server on :3000
-npm run demo            # scripted client, prints every step
+npm run dev:rs          # MCP resource server on :3000 (needs the AS running)
+npm run demo            # scripted client against them, prints every step
 ```
 
 Confirm the boundary is closed:
@@ -113,7 +115,7 @@ a token.
 
 > You cannot complete the full flow with `curl` alone: a client must *publish* a
 > metadata document at its own `client_id` URL for the authorization server to
-> fetch. `npm run demo` stands one up for you.
+> fetch. `npm run demo` (and the browser demo) stands one up for you.
 
 ### Verify everything
 
@@ -193,6 +195,30 @@ document describing the client:
   "scope": "mcp:tools",
   "jwks": { "keys": [{ "kty": "EC", "crv": "P-256", "x": "…", "y": "…" }] }
 }
+```
+
+### The validation flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as MCP Client
+    participant AS as Authorization Server
+    participant CIMD as Client's Metadata URL
+    participant RS as MCP Resource Server
+
+    C->>AS: POST /token (client_credentials + private_key_jwt)
+    Note over AS: the assertion's iss claim IS the client_id (an https URL)
+    AS->>AS: allowlist + SSRF guards on client_id
+    AS->>CIMD: GET client_id
+    CIMD-->>AS: metadata document (jwks, auth method)
+    Note over AS: document.client_id must equal the fetched URL
+    Note over AS: no redirects, no private IPs, size and type limits
+    AS->>AS: verify assertion signature vs jwks — check aud, exp, jti
+    AS-->>C: access_token (aud = resource, scope narrowed)
+    C->>RS: POST /mcp (Authorization: Bearer TOKEN)
+    RS->>RS: verify JWT iss, aud, scope, signature via JWKS
+    RS-->>C: 200 JSON-RPC result — or 401 / 403
 ```
 
 **This makes the authorization server an HTTP client pointed at an
@@ -320,13 +346,27 @@ src/
   mock-as/
     app.ts                   authorization server
     verify-client.ts         proves client identity per mechanism
-  demo/                      hosted interactive demo
+  demo/
+    server.ts                all-in-one demo (AS + RS + UI)
+    scenarios.ts             the eight runnable scenarios
+    page.ts                  self-contained demo UI
+    public-url.ts            robust PUBLIC_URL resolution
   util/safe-compare.ts       constant-time string comparison
 test/                        132 tests
 scripts/
   demo-client.ts             scripted end-to-end client
   hash-secret.ts             client secret generation
 ```
+
+---
+
+## Work with Coreframe Labs
+
+**Scaling your company's AI integrations?** We help venture-backed teams and
+enterprises build secure, production-grade custom software architectures. Let's
+design your agent infrastructure safely.
+
+**[Talk to our Core Architects →](https://coreframe-website-six.vercel.app/#data)**
 
 ---
 
